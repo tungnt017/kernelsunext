@@ -369,6 +369,12 @@ jobs:
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="github-actions"
 
+          # Suppress Clang 21 warnings promoted to errors on older kernels (5.4)
+          # -Wno-enum-conversion:                          rmnet_ipa.c enum mismatch
+          # -Wno-single-bit-bitfield-constant-conversion:  tcp_timer.c / usbdtp.c 1-bit bitfield
+          # -Wno-array-parameter:                          qcacld parser_api.c array bound mismatch
+          export KCFLAGS="-Wno-enum-conversion -Wno-single-bit-bitfield-constant-conversion -Wno-array-parameter"
+
           MAKE_ARGS=(
             ARCH=arm64
             SUBARCH=arm64
