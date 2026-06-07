@@ -66,7 +66,7 @@ jobs:
             python3 python-is-python3 zip unzip curl wget \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            libncurses-dev cpio jq git
+            libncurses-dev cpio jq git lld
 
       # ---------------------------------------------------------------
       # 3. Clone Clang/LLVM toolchain
@@ -84,14 +84,58 @@ jobs:
             wget -q "$CLANG_URL" -O clang.tar.gz
             tar -xzf clang.tar.gz --strip-components=1
             rm -f clang.tar.gz
+
+            # If bin/clang not found, tarball may have different structure
+            if [ ! -f "bin/clang" ]; then
+              echo "⚠️  bin/clang not found after --strip-components=1"
+              echo "📋 Trying without --strip-components..."
+              wget -q "$CLANG_URL" -O clang.tar.gz
+              rm -rf bin lib include
+              tar -xzf clang.tar.gz
+              rm -f clang.tar.gz
+              # Move contents from nested directory if present
+              if ls -d */bin/clang 2>/dev/null; then
+                NESTED_DIR=$(ls -d */bin/clang | head -1 | cut -d'/' -f1)
+                echo "📋 Found nested directory: $NESTED_DIR"
+                mv "$NESTED_DIR"/* .
+                rmdir "$NESTED_DIR" 2>/dev/null || true
+              fi
+            fi
           else
             echo "📦 Cloning Clang repository..."
             git clone --depth=1 "$CLANG_URL" .
           fi
 
-          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
-          echo "✅ Clang version:"
-          $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version || true
+          CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
+
+          # Verify clang binary exists
+          if [ ! -f "$CLANG_BIN/clang" ]; then
+            echo "❌ clang binary not found in $CLANG_BIN!"
+            echo "📋 Contents of toolchain directory:"
+            find . -maxdepth 3 -type f -name "clang*" 2>/dev/null
+            exit 1
+          fi
+
+          # Check ld.lld — create symlink if missing but lld exists
+          if [ ! -f "$CLANG_BIN/ld.lld" ]; then
+            if [ -f "$CLANG_BIN/lld" ]; then
+              echo "⚠️  ld.lld not found, creating symlink from lld..."
+              ln -sf "$CLANG_BIN/lld" "$CLANG_BIN/ld.lld"
+            else
+              echo "⚠️  ld.lld not found in toolchain — will use system lld"
+            fi
+          fi
+
+          echo "$CLANG_BIN" >> $GITHUB_PATH
+
+          echo ""
+          echo "✅ Toolchain verification:"
+          echo "  clang:   $($CLANG_BIN/clang --version | head -1)"
+          echo "  ld.lld:  $([ -f "$CLANG_BIN/ld.lld" ] && $CLANG_BIN/ld.lld --version | head -1 || echo 'NOT FOUND in toolchain')"
+          echo "  llvm-ar: $([ -f "$CLANG_BIN/llvm-ar" ] && echo 'OK' || echo 'NOT FOUND')"
+          echo ""
+          echo "📋 Key binaries in $CLANG_BIN:"
+          ls -la "$CLANG_BIN"/{clang,ld.lld,lld,llvm-ar,llvm-nm,llvm-objcopy,llvm-strip} 2>/dev/null || true
 
       # ---------------------------------------------------------------
       # 4. Clone kernel source
@@ -182,8 +226,6 @@ jobs:
           #endif\n' fs/exec.c
 
             # Add hook call inside do_execve — after the envp variable declaration
-            # Pattern: find "struct user_arg_ptr envp = { .ptr.native = __envp };"
-            # and add the hook call after it (inside do_execve)
             sed -i '/struct user_arg_ptr argv = { \.ptr\.native = __argv };/{
               N
               /struct user_arg_ptr envp = { \.ptr\.native = __envp };/a \
@@ -193,7 +235,6 @@ jobs:
             }' fs/exec.c
 
             # Also patch compat_do_execve for 32-bit support
-            # Look for the compat version's envp declaration
             sed -i '/\.ptr\.compat = __envp,/{
               N
               /};/a \
@@ -212,7 +253,6 @@ jobs:
           if grep -q "ksu_handle_faccessat" fs/open.c; then
             echo "  ⏭️  fs/open.c already patched, skipping..."
           else
-            # Add extern declaration at the top of the file (after includes)
             sed -i '/#include <linux\/fs\.h>/a \
           \n\
           #ifdef CONFIG_KSU\n\
@@ -220,10 +260,7 @@ jobs:
           \t\t\t\tint *mode, int *flags);\n\
           #endif' fs/open.c
 
-            # Add hook call inside do_faccessat — after variable declarations
-            # Find the function and add the hook after the initial variable setup
             sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode/{
-              # Read lines until we find the opening brace pattern
               N;N;N;N;N
               /struct path path;/a \
           #ifdef CONFIG_KSU\n\
@@ -241,7 +278,6 @@ jobs:
           if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
             echo "  ⏭️  fs/read_write.c already patched, skipping..."
           else
-            # Add extern declaration before vfs_read function
             sed -i '/^ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/i \
           #ifdef CONFIG_KSU\n\
           extern bool ksu_vfs_read_hook __read_mostly;\n\
@@ -249,7 +285,6 @@ jobs:
           \t\t\t\tsize_t *count_ptr, loff_t **pos);\n\
           #endif' fs/read_write.c
 
-            # Add hook call inside vfs_read — after the initial checks
             sed -i '/ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/{
               N
               /^{/a \
@@ -269,7 +304,6 @@ jobs:
           if grep -q "ksu_handle_stat" fs/stat.c; then
             echo "  ⏭️  fs/stat.c already patched, skipping..."
           else
-            # Add extern declaration near the top
             sed -i '/#include <linux\/fs\.h>/a \
           \n\
           #ifdef CONFIG_KSU\n\
@@ -277,7 +311,6 @@ jobs:
           \t\t\t\tint *flags);\n\
           #endif' fs/stat.c
 
-            # Hook into vfs_statx — add after the function signature
             sed -i '/int vfs_statx(int dfd, const char __user \*filename, int flags,/{
               N
               /struct path path;/a \
@@ -296,7 +329,6 @@ jobs:
           if grep -q "ksu_handle_reboot" kernel/reboot.c; then
             echo "  ⏭️  kernel/reboot.c already patched, skipping..."
           else
-            # Add extern declaration near the top
             sed -i '/#include <linux\/reboot\.h>/a \
           \n\
           #ifdef CONFIG_KSU\n\
@@ -304,8 +336,6 @@ jobs:
           extern int ksu_handle_reboot(void);\n\
           #endif' kernel/reboot.c
 
-            # Hook into __orderly_reboot or the reboot syscall
-            # For kernels with SYSCALL_DEFINE4(reboot, ...)
             sed -i '/SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/{
               N;N;N;N
               /mutex_lock/i \
@@ -335,15 +365,20 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/kernel
 
+          # Create out directory for build logs BEFORE make runs
+          mkdir -p out
+
           export ARCH=arm64
           export SUBARCH=arm64
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="github-actions"
 
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
           MAKE_ARGS=(
             ARCH=arm64
             SUBARCH=arm64
             CC=clang
+            LD=ld.lld
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-

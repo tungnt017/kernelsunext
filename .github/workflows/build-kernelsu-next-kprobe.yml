@@ -66,7 +66,7 @@ jobs:
             python3 python-is-python3 zip unzip curl wget \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            libncurses-dev cpio jq git
+            libncurses-dev cpio jq git lld
 
       # ---------------------------------------------------------------
       # 3. Clone Clang/LLVM toolchain
@@ -84,14 +84,58 @@ jobs:
             wget -q "$CLANG_URL" -O clang.tar.gz
             tar -xzf clang.tar.gz --strip-components=1
             rm -f clang.tar.gz
+
+            # If bin/clang not found, tarball may have different structure
+            if [ ! -f "bin/clang" ]; then
+              echo "⚠️  bin/clang not found after --strip-components=1"
+              echo "📋 Trying without --strip-components..."
+              wget -q "$CLANG_URL" -O clang.tar.gz
+              rm -rf bin lib include
+              tar -xzf clang.tar.gz
+              rm -f clang.tar.gz
+              # Move contents from nested directory if present
+              if ls -d */bin/clang 2>/dev/null; then
+                NESTED_DIR=$(ls -d */bin/clang | head -1 | cut -d'/' -f1)
+                echo "📋 Found nested directory: $NESTED_DIR"
+                mv "$NESTED_DIR"/* .
+                rmdir "$NESTED_DIR" 2>/dev/null || true
+              fi
+            fi
           else
             echo "📦 Cloning Clang repository..."
             git clone --depth=1 "$CLANG_URL" .
           fi
 
-          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
-          echo "✅ Clang version:"
-          $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version || true
+          CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
+
+          # Verify clang binary exists
+          if [ ! -f "$CLANG_BIN/clang" ]; then
+            echo "❌ clang binary not found in $CLANG_BIN!"
+            echo "📋 Contents of toolchain directory:"
+            find . -maxdepth 3 -type f -name "clang*" 2>/dev/null
+            exit 1
+          fi
+
+          # Check ld.lld — create symlink if missing but lld exists
+          if [ ! -f "$CLANG_BIN/ld.lld" ]; then
+            if [ -f "$CLANG_BIN/lld" ]; then
+              echo "⚠️  ld.lld not found, creating symlink from lld..."
+              ln -sf "$CLANG_BIN/lld" "$CLANG_BIN/ld.lld"
+            else
+              echo "⚠️  ld.lld not found in toolchain — will use system lld"
+            fi
+          fi
+
+          echo "$CLANG_BIN" >> $GITHUB_PATH
+
+          echo ""
+          echo "✅ Toolchain verification:"
+          echo "  clang:   $($CLANG_BIN/clang --version | head -1)"
+          echo "  ld.lld:  $([ -f "$CLANG_BIN/ld.lld" ] && $CLANG_BIN/ld.lld --version | head -1 || echo 'NOT FOUND in toolchain')"
+          echo "  llvm-ar: $([ -f "$CLANG_BIN/llvm-ar" ] && echo 'OK' || echo 'NOT FOUND')"
+          echo ""
+          echo "📋 Key binaries in $CLANG_BIN:"
+          ls -la "$CLANG_BIN"/{clang,ld.lld,lld,llvm-ar,llvm-nm,llvm-objcopy,llvm-strip} 2>/dev/null || true
 
       # ---------------------------------------------------------------
       # 4. Clone kernel source
@@ -169,15 +213,20 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/kernel
 
+          # Create out directory for build logs BEFORE make runs
+          mkdir -p out
+
           export ARCH=arm64
           export SUBARCH=arm64
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="github-actions"
 
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
           MAKE_ARGS=(
             ARCH=arm64
             SUBARCH=arm64
             CC=clang
+            LD=ld.lld
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
