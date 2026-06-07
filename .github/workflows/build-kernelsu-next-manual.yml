@@ -49,15 +49,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------------------------------------------------------
-      # 1. Checkout this repository (for workflow files)
-      # ---------------------------------------------------------------
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------------
-      # 2. Install build dependencies
-      # ---------------------------------------------------------------
       - name: Install dependencies
         run: |
           sudo apt-get update -y
@@ -68,9 +62,6 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses-dev cpio jq git lld
 
-      # ---------------------------------------------------------------
-      # 3. Clone Clang/LLVM toolchain
-      # ---------------------------------------------------------------
       - name: Setup Clang toolchain
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchain/clang
@@ -78,14 +69,12 @@ jobs:
 
           CLANG_URL="${{ github.event.inputs.CLANG_REPO }}"
 
-          # Support both .tar.gz releases and git repos
           if [[ "$CLANG_URL" == *.tar.gz ]]; then
             echo "📦 Downloading Clang tarball..."
             wget -q "$CLANG_URL" -O clang.tar.gz
             tar -xzf clang.tar.gz --strip-components=1
             rm -f clang.tar.gz
 
-            # If bin/clang not found, tarball may have different structure
             if [ ! -f "bin/clang" ]; then
               echo "⚠️  bin/clang not found after --strip-components=1"
               echo "📋 Trying without --strip-components..."
@@ -107,15 +96,12 @@ jobs:
 
           CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
 
-          # Verify clang binary exists
           if [ ! -f "$CLANG_BIN/clang" ]; then
             echo "❌ clang binary not found in $CLANG_BIN!"
-            echo "📋 Contents of toolchain directory:"
             find . -maxdepth 3 -type f -name "clang*" 2>/dev/null
             exit 1
           fi
 
-          # Check ld.lld — create symlink if missing but lld exists
           if [ ! -f "$CLANG_BIN/ld.lld" ]; then
             if [ -f "$CLANG_BIN/lld" ]; then
               echo "⚠️  ld.lld not found, creating symlink from lld..."
@@ -136,9 +122,6 @@ jobs:
           echo "📋 Key binaries in $CLANG_BIN:"
           ls -la "$CLANG_BIN"/{clang,ld.lld,lld,llvm-ar,llvm-nm,llvm-objcopy,llvm-strip} 2>/dev/null || true
 
-      # ---------------------------------------------------------------
-      # 4. Clone kernel source
-      # ---------------------------------------------------------------
       - name: Clone kernel source
         run: |
           git clone --depth=1 \
@@ -147,9 +130,6 @@ jobs:
             $GITHUB_WORKSPACE/kernel
           echo "✅ Kernel source cloned successfully"
 
-      # ---------------------------------------------------------------
-      # 5. Add KernelSU Next to kernel source tree
-      # ---------------------------------------------------------------
       - name: Integrate KernelSU Next
         run: |
           cd $GITHUB_WORKSPACE/kernel
@@ -158,7 +138,6 @@ jobs:
             | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
           echo "✅ KernelSU Next integrated"
 
-          # Verify KernelSU-Next directory exists
           if [ -d "KernelSU-Next" ]; then
             echo "✅ KernelSU-Next directory found"
             ls -la KernelSU-Next/
@@ -169,7 +148,6 @@ jobs:
             exit 1
           fi
 
-          # Verify symlink at drivers/kernelsu
           if [ -L "drivers/kernelsu" ] || [ -d "drivers/kernelsu" ]; then
             echo "✅ drivers/kernelsu symlink found"
             ls -la drivers/kernelsu
@@ -177,9 +155,6 @@ jobs:
             echo "⚠️  drivers/kernelsu symlink not found — check setup.sh output"
           fi
 
-      # ---------------------------------------------------------------
-      # 6. Configure kernel — enable CONFIG_KSU
-      # ---------------------------------------------------------------
       - name: Configure kernel (enable CONFIG_KSU)
         run: |
           cd $GITHUB_WORKSPACE/kernel
@@ -187,10 +162,8 @@ jobs:
 
           echo "📝 Patching defconfig: $DEFCONFIG_PATH"
 
-          # Remove any existing conflicting configs
           sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
 
-          # Append KSU config (kprobe hooks disabled — using manual hooks)
           cat >> "$DEFCONFIG_PATH" <<'EOF'
 
           # KernelSU Next (manual hooks method)
@@ -200,17 +173,11 @@ jobs:
           echo "✅ Defconfig updated. Appended configs:"
           tail -5 "$DEFCONFIG_PATH"
 
-      # ---------------------------------------------------------------
-      # 7. Apply manual hook patches to kernel source files
-      # ---------------------------------------------------------------
       - name: Apply manual KernelSU hook patches
         run: |
           cd $GITHUB_WORKSPACE/kernel
           echo "🔧 Applying manual hook patches to kernel source..."
 
-          # ===========================================================
-          # PATCH 1: fs/exec.c — Hook do_execveat / do_execve
-          # ===========================================================
           echo "📝 Patching fs/exec.c..."
           if grep -q "ksu_handle_execveat" fs/exec.c; then
             echo "  ⏭️  fs/exec.c already patched, skipping..."
@@ -241,9 +208,6 @@ jobs:
             echo "  ✅ fs/exec.c patched"
           fi
 
-          # ===========================================================
-          # PATCH 2: fs/open.c — Hook faccessat syscall
-          # ===========================================================
           echo "📝 Patching fs/open.c..."
           if grep -q "ksu_handle_faccessat" fs/open.c; then
             echo "  ⏭️  fs/open.c already patched, skipping..."
@@ -266,9 +230,6 @@ jobs:
             echo "  ✅ fs/open.c patched"
           fi
 
-          # ===========================================================
-          # PATCH 3: fs/read_write.c — Hook vfs_read
-          # ===========================================================
           echo "📝 Patching fs/read_write.c..."
           if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
             echo "  ⏭️  fs/read_write.c already patched, skipping..."
@@ -292,9 +253,6 @@ jobs:
             echo "  ✅ fs/read_write.c patched"
           fi
 
-          # ===========================================================
-          # PATCH 4: fs/stat.c — Hook vfs_statx / newstat syscall
-          # ===========================================================
           echo "📝 Patching fs/stat.c..."
           if grep -q "ksu_handle_stat" fs/stat.c; then
             echo "  ⏭️  fs/stat.c already patched, skipping..."
@@ -317,9 +275,6 @@ jobs:
             echo "  ✅ fs/stat.c patched"
           fi
 
-          # ===========================================================
-          # PATCH 5: kernel/reboot.c — Hook reboot syscall
-          # ===========================================================
           echo "📝 Patching kernel/reboot.c..."
           if grep -q "ksu_handle_reboot" kernel/reboot.c; then
             echo "  ⏭️  kernel/reboot.c already patched, skipping..."
@@ -353,15 +308,11 @@ jobs:
             echo "  $f: $COUNT KSU references"
           done
 
-      # ---------------------------------------------------------------
-      # 8. Build the kernel
-      # ---------------------------------------------------------------
       - name: Build kernel
         run: |
           set -o pipefail
           cd $GITHUB_WORKSPACE/kernel
 
-          # Create out directory for build logs BEFORE make runs
           mkdir -p out
 
           export ARCH=arm64
@@ -373,7 +324,8 @@ jobs:
           # -Wno-enum-conversion:                          rmnet_ipa.c enum mismatch
           # -Wno-single-bit-bitfield-constant-conversion:  tcp_timer.c / usbdtp.c 1-bit bitfield
           # -Wno-array-parameter:                          qcacld parser_api.c array bound mismatch
-          export KCFLAGS="-Wno-enum-conversion -Wno-single-bit-bitfield-constant-conversion -Wno-array-parameter"
+          # -Wno-implicit-int:                             sde_hw_dsc_1_2.c missing return type
+          export KCFLAGS="-Wno-enum-conversion -Wno-single-bit-bitfield-constant-conversion -Wno-array-parameter -Wno-implicit-int"
 
           MAKE_ARGS=(
             ARCH=arm64
@@ -403,9 +355,6 @@ jobs:
           echo "✅ Build completed. Checking output files..."
           find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" -o -name "*.dtbo" \) 2>/dev/null || true
 
-      # ---------------------------------------------------------------
-      # 9. Check build output
-      # ---------------------------------------------------------------
       - name: Check build output
         if: always()
         run: |
@@ -425,9 +374,6 @@ jobs:
           echo "📋 Searching for DTBO files:"
           find out -type f -name "*.dtbo" 2>/dev/null | head -20 || echo "  (no DTBO files found)"
 
-      # ---------------------------------------------------------------
-      # 10. Upload build log
-      # ---------------------------------------------------------------
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -439,9 +385,6 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # ---------------------------------------------------------------
-      # 11. Package with AnyKernel3
-      # ---------------------------------------------------------------
       - name: Package with AnyKernel3
         run: |
           cd $GITHUB_WORKSPACE
@@ -450,13 +393,11 @@ jobs:
           git clone --depth=1 ${{ github.event.inputs.ANYKERNEL3_REPO }} AnyKernel3
           cd AnyKernel3
 
-          # Clean up AnyKernel3 defaults
           rm -rf .git .github modules patch ramdisk README.md
 
           KERNEL_OUT="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
           FOUND_IMAGE=false
 
-          # --- Kernel Image ---
           for img in Image.gz Image Image.gz-dtb zImage zImage-dtb; do
             if [ -f "$KERNEL_OUT/$img" ]; then
               cp "$KERNEL_OUT/$img" .
@@ -466,7 +407,6 @@ jobs:
             fi
           done
 
-          # Fallback: search recursively under out/
           if [ "$FOUND_IMAGE" = false ]; then
             echo "⚠️  No kernel image in standard path, searching recursively..."
             FOUND=$(find "$GITHUB_WORKSPACE/kernel/out" -type f \( -name "Image.gz" -o -name "Image" -o -name "Image.gz-dtb" \) | head -1)
@@ -476,13 +416,11 @@ jobs:
               FOUND_IMAGE=true
             else
               echo "❌ No kernel image found anywhere in out/!"
-              echo "📋 All files in out/arch/arm64/boot/:"
               find "$KERNEL_OUT" -type f 2>/dev/null
               exit 1
             fi
           fi
 
-          # --- DTB ---
           if [ -f "$KERNEL_OUT/dtb.img" ]; then
             cp "$KERNEL_OUT/dtb.img" ./dtb
             echo "✅ Copied dtb.img as dtb"
@@ -505,7 +443,6 @@ jobs:
             fi
           fi
 
-          # --- DTBO ---
           if [ -f "$KERNEL_OUT/dtbo.img" ]; then
             cp "$KERNEL_OUT/dtbo.img" .
             echo "✅ Copied dtbo.img"
@@ -522,12 +459,10 @@ jobs:
             fi
           fi
 
-          # --- List what's being packaged ---
           echo ""
           echo "📋 AnyKernel3 package contents:"
           ls -la *.gz *.dtb *.dtbo *.img Image* zImage* dtb dtbo 2>/dev/null || echo "  (only script files)"
 
-          # Create flashable zip
           DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
           DATE=$(date +%Y%m%d-%H%M)
           ZIP_NAME="KernelSU-Next-manual-${DEVICE}-${DATE}.zip"
@@ -536,9 +471,6 @@ jobs:
           echo "✅ AnyKernel3 zip created: $ZIP_NAME"
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-      # ---------------------------------------------------------------
-      # 12. Upload AnyKernel3 zip
-      # ---------------------------------------------------------------
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
@@ -546,9 +478,6 @@ jobs:
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
 
-      # ---------------------------------------------------------------
-      # 13. Upload raw kernel images
-      # ---------------------------------------------------------------
       - name: Upload kernel images
         uses: actions/upload-artifact@v4
         with:
