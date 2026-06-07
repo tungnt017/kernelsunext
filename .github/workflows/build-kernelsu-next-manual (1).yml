@@ -238,22 +238,22 @@ jobs:
             if [ -n "$FUNC_LINE" ]; then
               # Insert extern declaration before function
               sed -i "${FUNC_LINE}i\\
-#ifdef CONFIG_KSU\\
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\\
-\t\t\t\tint *mode, int *flags);\\
-#endif" fs/open.c
-
-              # Find opening brace and first code line after variable declarations
-              FUNC_LINE=$((FUNC_LINE + 4))
-              # Find "struct path" or "struct cred" — common variables in do_faccessat
-              VAR_LINE=$(awk "NR>=${FUNC_LINE} && /struct (path|cred)/" fs/open.c | head -1)
-              VAR_LINENO=$(grep -n "struct path\|struct cred" fs/open.c | awk -F: -v start="$FUNC_LINE" '$1 >= start {print $1; exit}')
-
-              if [ -n "$VAR_LINENO" ]; then
-                sed -i "${VAR_LINENO}a\\
-#ifdef CONFIG_KSU\\
-\tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\\
-#endif" fs/open.c
+          #ifdef CONFIG_KSU\\
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\\
+          \t\t\t\tint *mode, int *flags);\\
+          #endif" fs/open.c
+          
+                        # Find opening brace and first code line after variable declarations
+                        FUNC_LINE=$((FUNC_LINE + 4))
+                        # Find "struct path" or "struct cred" — common variables in do_faccessat
+                        VAR_LINE=$(awk "NR>=${FUNC_LINE} && /struct (path|cred)/" fs/open.c | head -1)
+                        VAR_LINENO=$(grep -n "struct path\|struct cred" fs/open.c | awk -F: -v start="$FUNC_LINE" '$1 >= start {print $1; exit}')
+          
+                        if [ -n "$VAR_LINENO" ]; then
+                          sed -i "${VAR_LINENO}a\\
+          #ifdef CONFIG_KSU\\
+          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\\
+          #endif" fs/open.c
                 echo "  ✅ do_faccessat hooked at line $VAR_LINENO"
               else
                 echo "  ⚠️  Could not find variable declaration in do_faccessat"
@@ -278,11 +278,11 @@ extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\\
             if [ -n "$FUNC_LINE" ]; then
               # Insert extern declaration before vfs_read
               sed -i "${FUNC_LINE}i\\
-#ifdef CONFIG_KSU\\
-extern bool ksu_vfs_read_hook __read_mostly;\\
-extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\\
-\t\t\t\tsize_t *count_ptr, loff_t **pos);\\
-#endif" fs/read_write.c
+            #ifdef CONFIG_KSU\\
+            extern bool ksu_vfs_read_hook __read_mostly;\\
+            extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\\
+            \t\t\t\tsize_t *count_ptr, loff_t **pos);\\
+            #endif" fs/read_write.c
 
               # Find opening brace of vfs_read (adjusted for inserted lines)
               FUNC_LINE=$((FUNC_LINE + 5))
@@ -291,10 +291,10 @@ extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\\
 
               if [ -n "$BRACE_LINENO" ]; then
                 sed -i "${BRACE_LINENO}a\\
-#ifdef CONFIG_KSU\\
-\tif (unlikely(ksu_vfs_read_hook))\\
-\t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\\
-#endif" fs/read_write.c
+            #ifdef CONFIG_KSU\\
+            \tif (unlikely(ksu_vfs_read_hook))\\
+            \t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\\
+            #endif" fs/read_write.c
                 echo "  ✅ vfs_read hooked at line $BRACE_LINENO"
               else
                 echo "  ⚠️  Could not find opening brace"
@@ -314,10 +314,10 @@ extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\\
             FUNC_LINE=$(grep -n "int vfs_statx(int dfd" fs/stat.c | head -1 | cut -d: -f1)
             if [ -n "$FUNC_LINE" ]; then
               sed -i "${FUNC_LINE}i\\
-#ifdef CONFIG_KSU\\
-extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\\
-\t\t\t\tint *flags);\\
-#endif" fs/stat.c
+          #ifdef CONFIG_KSU\\
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\\
+          \t\t\t\tint *flags);\\
+          #endif" fs/stat.c
 
               FUNC_LINE=$((FUNC_LINE + 4))
               # Find "struct path" in vfs_statx
@@ -325,9 +325,9 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\\
 
               if [ -n "$VAR_LINENO" ]; then
                 sed -i "${VAR_LINENO}a\\
-#ifdef CONFIG_KSU\\
-\tksu_handle_stat(\&dfd, \&filename, \&flags);\\
-#endif" fs/stat.c
+            #ifdef CONFIG_KSU\\
+            \tksu_handle_stat(\&dfd, \&filename, \&flags);\\
+            #endif" fs/stat.c
                 echo "  ✅ vfs_statx hooked at line $VAR_LINENO"
               else
                 echo "  ⚠️  Could not find struct path in vfs_statx"
@@ -348,11 +348,11 @@ extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\\
             INCLUDE_LINE=$(grep -n "#include <linux/reboot.h>" kernel/reboot.c | head -1 | cut -d: -f1)
             if [ -n "$INCLUDE_LINE" ]; then
               sed -i "${INCLUDE_LINE}a\\
-\\
-#ifdef CONFIG_KSU\\
-extern bool ksu_android_reboot_trigger __read_mostly;\\
-extern int ksu_handle_reboot(void);\\
-#endif" kernel/reboot.c
+            \\
+            #ifdef CONFIG_KSU\\
+            extern bool ksu_android_reboot_trigger __read_mostly;\\
+            extern int ksu_handle_reboot(void);\\
+            #endif" kernel/reboot.c
             fi
 
             # Find SYSCALL_DEFINE4(reboot
@@ -362,9 +362,9 @@ extern int ksu_handle_reboot(void);\\
               MUTEX_LINE=$(grep -n "mutex_lock" kernel/reboot.c | awk -F: -v start="$SYSCALL_LINE" '$1 > start {print $1; exit}')
               if [ -n "$MUTEX_LINE" ]; then
                 sed -i "${MUTEX_LINE}i\\
-#ifdef CONFIG_KSU\\
-\tksu_handle_reboot();\\
-#endif" kernel/reboot.c
+            #ifdef CONFIG_KSU\\
+            \tksu_handle_reboot();\\
+            #endif" kernel/reboot.c
                 echo "  ✅ reboot syscall hooked at line $MUTEX_LINE"
               else
                 echo "  ⚠️  Could not find mutex_lock in reboot syscall"
