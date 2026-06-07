@@ -1,15 +1,15 @@
 # =============================================================================
-# KernelSU Next — Non-GKI Integration (Method 2: Manual Hook Patches)
+# KernelSU Next — Non-GKI Integration (Method 1: kprobe / Automatic Hooks)
 # =============================================================================
 # This workflow builds a custom Android kernel with KernelSU Next integrated
-# using manual source code modifications. This method patches 5 kernel source
-# files to add KernelSU hook calls directly.
+# using the kprobe method. kprobe dynamically hooks kernel functions at runtime,
+# so no manual source patching is required.
 #
 # Target device : Xiaomi 11 Lite NE 5G (lisa) — Linux 5.4
-# Recommended for: Kernels where kprobe is broken or older than 4.14
+# Recommended for: Kernels >= 4.14 where kprobe works reliably
 # =============================================================================
 
-name: Build KernelSU Next (Manual Hooks)
+name: Build KernelSU Next (kprobe)
 
 on:
   workflow_dispatch:
@@ -45,7 +45,7 @@ on:
 
 jobs:
   build:
-    name: Build Kernel (Manual Hooks)
+    name: Build Kernel (kprobe)
     runs-on: ubuntu-latest
 
     steps:
@@ -125,9 +125,9 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
-      # 6. Configure kernel — enable CONFIG_KSU
+      # 6. Configure kernel — enable kprobe hooks
       # ---------------------------------------------------------------
-      - name: Configure kernel (enable CONFIG_KSU)
+      - name: Configure kernel (enable kprobe)
         run: |
           cd $GITHUB_WORKSPACE/kernel
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.DEFCONFIG }}"
@@ -136,189 +136,23 @@ jobs:
 
           # Remove any existing conflicting configs
           sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
+          sed -i '/CONFIG_KSU_KPROBE_HOOKS/d' "$DEFCONFIG_PATH"
 
-          # Append KSU config (kprobe hooks disabled — using manual hooks)
+          # Append kprobe-related configs
           cat >> "$DEFCONFIG_PATH" <<'EOF'
 
-          # KernelSU Next (manual hooks method)
+          # KernelSU Next (kprobe method)
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_KPROBE_HOOKS=y
           CONFIG_KSU=y
           EOF
 
           echo "✅ Defconfig updated. Appended configs:"
-          tail -5 "$DEFCONFIG_PATH"
+          tail -10 "$DEFCONFIG_PATH"
 
       # ---------------------------------------------------------------
-      # 7. Apply manual hook patches to kernel source files
-      # ---------------------------------------------------------------
-      - name: Apply manual KernelSU hook patches
-        run: |
-          cd $GITHUB_WORKSPACE/kernel
-          echo "🔧 Applying manual hook patches to kernel source..."
-
-          # ===========================================================
-          # PATCH 1: fs/exec.c — Hook do_execveat / do_execve
-          # ===========================================================
-          echo "📝 Patching fs/exec.c..."
-          if grep -q "ksu_handle_execveat" fs/exec.c; then
-            echo "  ⏭️  fs/exec.c already patched, skipping..."
-          else
-            # Add extern declaration before do_execve
-            sed -i '/^int do_execve(struct filename \*filename,/i \
-          #ifdef CONFIG_KSU\n\
-          __attribute__((hot))\n\
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\
-          \t\t\t\tvoid *argv, void *envp, int *flags);\n\
-          #endif\n' fs/exec.c
-
-            # Add hook call inside do_execve — after the envp variable declaration
-            # Pattern: find "struct user_arg_ptr envp = { .ptr.native = __envp };"
-            # and add the hook call after it (inside do_execve)
-            sed -i '/struct user_arg_ptr argv = { \.ptr\.native = __argv };/{
-              N
-              /struct user_arg_ptr envp = { \.ptr\.native = __envp };/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\n\
-          #endif
-            }' fs/exec.c
-
-            # Also patch compat_do_execve for 32-bit support
-            # Look for the compat version's envp declaration
-            sed -i '/\.ptr\.compat = __envp,/{
-              N
-              /};/a \
-          #ifdef CONFIG_KSU \/\/ 32-bit ksud and 32-on-64 support\n\
-          \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\n\
-          #endif
-            }' fs/exec.c
-
-            echo "  ✅ fs/exec.c patched"
-          fi
-
-          # ===========================================================
-          # PATCH 2: fs/open.c — Hook faccessat syscall
-          # ===========================================================
-          echo "📝 Patching fs/open.c..."
-          if grep -q "ksu_handle_faccessat" fs/open.c; then
-            echo "  ⏭️  fs/open.c already patched, skipping..."
-          else
-            # Add extern declaration at the top of the file (after includes)
-            sed -i '/#include <linux\/fs\.h>/a \
-          \n\
-          #ifdef CONFIG_KSU\n\
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\
-          \t\t\t\tint *mode, int *flags);\n\
-          #endif' fs/open.c
-
-            # Add hook call inside do_faccessat — after variable declarations
-            # Find the function and add the hook after the initial variable setup
-            sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode/{
-              # Read lines until we find the opening brace pattern
-              N;N;N;N;N
-              /struct path path;/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\n\
-          #endif
-            }' fs/open.c
-
-            echo "  ✅ fs/open.c patched"
-          fi
-
-          # ===========================================================
-          # PATCH 3: fs/read_write.c — Hook vfs_read
-          # ===========================================================
-          echo "📝 Patching fs/read_write.c..."
-          if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
-            echo "  ⏭️  fs/read_write.c already patched, skipping..."
-          else
-            # Add extern declaration before vfs_read function
-            sed -i '/^ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/i \
-          #ifdef CONFIG_KSU\n\
-          extern bool ksu_vfs_read_hook __read_mostly;\n\
-          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n\
-          \t\t\t\tsize_t *count_ptr, loff_t **pos);\n\
-          #endif' fs/read_write.c
-
-            # Add hook call inside vfs_read — after the initial checks
-            sed -i '/ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/{
-              N
-              /^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tif (unlikely(ksu_vfs_read_hook))\n\
-          \t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\n\
-          #endif
-            }' fs/read_write.c
-
-            echo "  ✅ fs/read_write.c patched"
-          fi
-
-          # ===========================================================
-          # PATCH 4: fs/stat.c — Hook vfs_statx / newstat syscall
-          # ===========================================================
-          echo "📝 Patching fs/stat.c..."
-          if grep -q "ksu_handle_stat" fs/stat.c; then
-            echo "  ⏭️  fs/stat.c already patched, skipping..."
-          else
-            # Add extern declaration near the top
-            sed -i '/#include <linux\/fs\.h>/a \
-          \n\
-          #ifdef CONFIG_KSU\n\
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\
-          \t\t\t\tint *flags);\n\
-          #endif' fs/stat.c
-
-            # Hook into vfs_statx — add after the function signature
-            sed -i '/int vfs_statx(int dfd, const char __user \*filename, int flags,/{
-              N
-              /struct path path;/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_stat(\&dfd, \&filename, \&flags);\n\
-          #endif
-            }' fs/stat.c
-
-            echo "  ✅ fs/stat.c patched"
-          fi
-
-          # ===========================================================
-          # PATCH 5: kernel/reboot.c — Hook reboot syscall
-          # ===========================================================
-          echo "📝 Patching kernel/reboot.c..."
-          if grep -q "ksu_handle_reboot" kernel/reboot.c; then
-            echo "  ⏭️  kernel/reboot.c already patched, skipping..."
-          else
-            # Add extern declaration near the top
-            sed -i '/#include <linux\/reboot\.h>/a \
-          \n\
-          #ifdef CONFIG_KSU\n\
-          extern bool ksu_android_reboot_trigger __read_mostly;\n\
-          extern int ksu_handle_reboot(void);\n\
-          #endif' kernel/reboot.c
-
-            # Hook into __orderly_reboot or the reboot syscall
-            # For kernels with SYSCALL_DEFINE4(reboot, ...)
-            sed -i '/SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/{
-              N;N;N;N
-              /mutex_lock/i \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_reboot();\n\
-          #endif
-            }' kernel/reboot.c
-
-            echo "  ✅ kernel/reboot.c patched"
-          fi
-
-          echo ""
-          echo "============================================"
-          echo "✅ All 5 manual hook patches applied!"
-          echo "============================================"
-          echo ""
-          echo "📋 Verification — checking for KSU hooks in patched files:"
-          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
-            COUNT=$(grep -c "CONFIG_KSU" "$f" 2>/dev/null || echo "0")
-            echo "  $f: $COUNT KSU references"
-          done
-
-      # ---------------------------------------------------------------
-      # 8. Build the kernel
+      # 7. Build the kernel
       # ---------------------------------------------------------------
       - name: Build kernel
         run: |
@@ -357,13 +191,13 @@ jobs:
           find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" \) 2>/dev/null || true
 
       # ---------------------------------------------------------------
-      # 9. Upload build log
+      # 8. Upload build log
       # ---------------------------------------------------------------
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          name: build-log-kprobe-${{ github.event.inputs.DEVICE_CODENAME }}
           path: |
             kernel/out/build_defconfig.log
             kernel/out/build.log
@@ -371,7 +205,7 @@ jobs:
           if-no-files-found: warn
 
       # ---------------------------------------------------------------
-      # 10. Package with AnyKernel3
+      # 9. Package with AnyKernel3
       # ---------------------------------------------------------------
       - name: Package with AnyKernel3
         run: |
@@ -419,29 +253,29 @@ jobs:
           # Create flashable zip
           DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
           DATE=$(date +%Y%m%d-%H%M)
-          ZIP_NAME="KernelSU-Next-manual-${DEVICE}-${DATE}.zip"
+          ZIP_NAME="KernelSU-Next-kprobe-${DEVICE}-${DATE}.zip"
 
           zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '*.git*'
           echo "✅ AnyKernel3 zip created: $ZIP_NAME"
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
       # ---------------------------------------------------------------
-      # 11. Upload AnyKernel3 zip
+      # 10. Upload AnyKernel3 zip
       # ---------------------------------------------------------------
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
-          name: KernelSU-Next-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          name: KernelSU-Next-kprobe-${{ github.event.inputs.DEVICE_CODENAME }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
 
       # ---------------------------------------------------------------
-      # 12. Upload raw kernel images
+      # 11. Upload raw kernel images
       # ---------------------------------------------------------------
       - name: Upload kernel images
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-images-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          name: kernel-images-kprobe-${{ github.event.inputs.DEVICE_CODENAME }}
           path: |
             kernel/out/arch/arm64/boot/Image
             kernel/out/arch/arm64/boot/Image.gz
