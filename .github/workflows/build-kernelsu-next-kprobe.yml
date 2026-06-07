@@ -211,6 +211,7 @@ jobs:
       # ---------------------------------------------------------------
       - name: Build kernel
         run: |
+          set -o pipefail
           cd $GITHUB_WORKSPACE/kernel
 
           # Create out directory for build logs BEFORE make runs
@@ -221,7 +222,6 @@ jobs:
           export KBUILD_BUILD_USER="builder"
           export KBUILD_BUILD_HOST="github-actions"
 
-          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
           MAKE_ARGS=(
             ARCH=arm64
             SUBARCH=arm64
@@ -248,10 +248,32 @@ jobs:
 
           echo ""
           echo "✅ Build completed. Checking output files..."
-          find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" \) 2>/dev/null || true
+          find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" -o -name "*.dtbo" \) 2>/dev/null || true
 
       # ---------------------------------------------------------------
-      # 8. Upload build log
+      # 8. Check build output
+      # ---------------------------------------------------------------
+      - name: Check build output
+        if: always()
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "📋 Full listing of out/arch/arm64/boot/:"
+          find out/arch/arm64/boot -type f 2>/dev/null | head -50 || echo "  (directory not found)"
+
+          echo ""
+          echo "📋 Searching for kernel images anywhere in out/:"
+          find out -type f \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "zImage" -o -name "zImage-dtb" \) 2>/dev/null || echo "  (no kernel images found)"
+
+          echo ""
+          echo "📋 Searching for DTB files:"
+          find out -type f -name "*.dtb" 2>/dev/null | head -20 || echo "  (no DTB files found)"
+
+          echo ""
+          echo "📋 Searching for DTBO files:"
+          find out -type f -name "*.dtbo" 2>/dev/null | head -20 || echo "  (no DTBO files found)"
+
+      # ---------------------------------------------------------------
+      # 9. Upload build log
       # ---------------------------------------------------------------
       - name: Upload build log
         if: always()
@@ -265,7 +287,7 @@ jobs:
           if-no-files-found: warn
 
       # ---------------------------------------------------------------
-      # 9. Package with AnyKernel3
+      # 10. Package with AnyKernel3
       # ---------------------------------------------------------------
       - name: Package with AnyKernel3
         run: |
@@ -278,37 +300,85 @@ jobs:
           # Clean up AnyKernel3 defaults
           rm -rf .git .github modules patch ramdisk README.md
 
-          # Copy kernel image
           KERNEL_OUT="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
-          if [ -f "$KERNEL_OUT/Image.gz" ]; then
-            cp "$KERNEL_OUT/Image.gz" .
-            echo "✅ Copied Image.gz"
-          elif [ -f "$KERNEL_OUT/Image" ]; then
-            cp "$KERNEL_OUT/Image" .
-            echo "✅ Copied Image"
-          elif [ -f "$KERNEL_OUT/Image.gz-dtb" ]; then
-            cp "$KERNEL_OUT/Image.gz-dtb" .
-            echo "✅ Copied Image.gz-dtb"
-          else
-            echo "❌ No kernel image found!"
-            find "$KERNEL_OUT" -type f 2>/dev/null
-            exit 1
+          FOUND_IMAGE=false
+
+          # --- Kernel Image ---
+          # Try standard locations first, then search recursively
+          for img in Image.gz Image Image.gz-dtb zImage zImage-dtb; do
+            if [ -f "$KERNEL_OUT/$img" ]; then
+              cp "$KERNEL_OUT/$img" .
+              echo "✅ Copied $img (from standard path)"
+              FOUND_IMAGE=true
+              break
+            fi
+          done
+
+          # Fallback: search recursively under out/
+          if [ "$FOUND_IMAGE" = false ]; then
+            echo "⚠️  No kernel image in standard path, searching recursively..."
+            FOUND=$(find "$GITHUB_WORKSPACE/kernel/out" -type f \( -name "Image.gz" -o -name "Image" -o -name "Image.gz-dtb" \) | head -1)
+            if [ -n "$FOUND" ]; then
+              cp "$FOUND" .
+              echo "✅ Copied $(basename $FOUND) (from $FOUND)"
+              FOUND_IMAGE=true
+            else
+              echo "❌ No kernel image found anywhere in out/!"
+              echo "📋 All files in out/arch/arm64/boot/:"
+              find "$KERNEL_OUT" -type f 2>/dev/null
+              exit 1
+            fi
           fi
 
-          # Copy DTB files if they exist
+          # --- DTB ---
+          # Check standard paths first
           if [ -f "$KERNEL_OUT/dtb.img" ]; then
-            cp "$KERNEL_OUT/dtb.img" .
-            echo "✅ Copied dtb.img"
+            cp "$KERNEL_OUT/dtb.img" ./dtb
+            echo "✅ Copied dtb.img as dtb"
           elif [ -f "$KERNEL_OUT/dtb" ]; then
             cp "$KERNEL_OUT/dtb" .
             echo "✅ Copied dtb"
+          else
+            # Qualcomm: search in dts/vendor/qcom/ for device-specific DTB
+            QCOM_DTB=$(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | head -1)
+            if [ -n "$QCOM_DTB" ]; then
+              # If multiple DTBs, cat them together (Qualcomm style)
+              DTB_COUNT=$(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | wc -l)
+              if [ "$DTB_COUNT" -eq 1 ]; then
+                cp "$QCOM_DTB" ./dtb
+                echo "✅ Copied DTB: $(basename $QCOM_DTB)"
+              else
+                cat $(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | sort) > ./dtb
+                echo "✅ Merged $DTB_COUNT DTB files into dtb"
+              fi
+            else
+              echo "ℹ️  No DTB files found (may not be needed)"
+            fi
           fi
 
-          # Copy DTBO if it exists
+          # --- DTBO ---
           if [ -f "$KERNEL_OUT/dtbo.img" ]; then
             cp "$KERNEL_OUT/dtbo.img" .
             echo "✅ Copied dtbo.img"
+          else
+            # Qualcomm: search for device-specific DTBO overlay
+            QCOM_DTBO=$(find "$KERNEL_OUT/dts" -type f -name "*${{ github.event.inputs.DEVICE_CODENAME }}*.dtbo" 2>/dev/null | head -1)
+            if [ -z "$QCOM_DTBO" ]; then
+              # Fallback: any .dtbo file
+              QCOM_DTBO=$(find "$KERNEL_OUT/dts" -type f -name "*.dtbo" 2>/dev/null | head -1)
+            fi
+            if [ -n "$QCOM_DTBO" ]; then
+              cp "$QCOM_DTBO" ./dtbo.img
+              echo "✅ Copied DTBO: $(basename $QCOM_DTBO) as dtbo.img"
+            else
+              echo "ℹ️  No DTBO files found (may not be needed)"
+            fi
           fi
+
+          # --- List what's being packaged ---
+          echo ""
+          echo "📋 AnyKernel3 package contents:"
+          ls -la *.gz *.dtb *.dtbo *.img Image* zImage* dtb dtbo 2>/dev/null || echo "  (only script files)"
 
           # Create flashable zip
           DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
@@ -320,7 +390,7 @@ jobs:
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
       # ---------------------------------------------------------------
-      # 10. Upload AnyKernel3 zip
+      # 11. Upload AnyKernel3 zip
       # ---------------------------------------------------------------
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
@@ -330,7 +400,7 @@ jobs:
           retention-days: 7
 
       # ---------------------------------------------------------------
-      # 11. Upload raw kernel images
+      # 12. Upload raw kernel images
       # ---------------------------------------------------------------
       - name: Upload kernel images
         uses: actions/upload-artifact@v4
@@ -342,5 +412,7 @@ jobs:
             kernel/out/arch/arm64/boot/Image.gz-dtb
             kernel/out/arch/arm64/boot/dtb*
             kernel/out/arch/arm64/boot/dtbo.img
+            kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtb
+            kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtbo
           retention-days: 7
           if-no-files-found: warn
