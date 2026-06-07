@@ -115,13 +115,24 @@ jobs:
             | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
           echo "✅ KernelSU Next integrated"
 
-          # Verify KernelSU directory exists
-          if [ -d "KernelSU" ]; then
-            echo "✅ KernelSU directory found"
-            ls -la KernelSU/
+          # Verify KernelSU-Next directory exists
+          # NOTE: setup.sh clones into "KernelSU-Next/" (not "KernelSU/")
+          if [ -d "KernelSU-Next" ]; then
+            echo "✅ KernelSU-Next directory found"
+            ls -la KernelSU-Next/
           else
-            echo "❌ KernelSU directory not found!"
+            echo "❌ KernelSU-Next directory not found!"
+            echo "📋 Listing root directory for debugging:"
+            ls -la
             exit 1
+          fi
+
+          # Verify symlink at drivers/kernelsu
+          if [ -L "drivers/kernelsu" ] || [ -d "drivers/kernelsu" ]; then
+            echo "✅ drivers/kernelsu symlink found"
+            ls -la drivers/kernelsu
+          else
+            echo "⚠️  drivers/kernelsu symlink not found — check setup.sh output"
           fi
 
       # ---------------------------------------------------------------
