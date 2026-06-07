@@ -186,38 +186,38 @@ jobs:
             if [ -n "$EXEC_LINE" ]; then
               # Insert extern declaration before do_execve
               sed -i "${EXEC_LINE}i\\
-#ifdef CONFIG_KSU\\
-__attribute__((hot))\\
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\\
-\t\t\t\tvoid *argv, void *envp, int *flags);\\
-#endif" fs/exec.c
-
-              # Recalculate — 5 lines were inserted
-              EXEC_LINE=$((EXEC_LINE + 5))
-
-              # Find "return do_execveat_common" inside do_execve (within next 15 lines)
-              RETURN_LINE=$(awk "NR>=${EXEC_LINE} && NR<=${EXEC_LINE}+15 && /return do_execveat_common/" fs/exec.c | head -1)
-              RETURN_LINENO=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$EXEC_LINE" '$1 >= start {print $1; exit}')
-
-              if [ -n "$RETURN_LINENO" ]; then
-                sed -i "${RETURN_LINENO}i\\
-#ifdef CONFIG_KSU\\
-\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
-#endif" fs/exec.c
-                echo "  ✅ do_execve hooked at line $RETURN_LINENO"
-              else
-                echo "  ⚠️  Could not find return line in do_execve"
-              fi
-
-              # Also hook compat_do_execve for 32-bit support
-              COMPAT_LINE=$(grep -n "compat_do_execve\|compat_do_execveat" fs/exec.c | grep -v "ksu\|#ifdef\|common" | tail -1 | cut -d: -f1)
-              if [ -n "$COMPAT_LINE" ]; then
-                COMPAT_RETURN=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$COMPAT_LINE" '$1 > start {print $1; exit}')
-                if [ -n "$COMPAT_RETURN" ]; then
-                  sed -i "${COMPAT_RETURN}i\\
-#ifdef CONFIG_KSU // 32-bit ksud support\\
-\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
-#endif" fs/exec.c
+            #ifdef CONFIG_KSU\\
+            __attribute__((hot))\\
+            extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\\
+            \t\t\t\tvoid *argv, void *envp, int *flags);\\
+            #endif" fs/exec.c
+            
+                          # Recalculate — 5 lines were inserted
+                          EXEC_LINE=$((EXEC_LINE + 5))
+            
+                          # Find "return do_execveat_common" inside do_execve (within next 15 lines)
+                          RETURN_LINE=$(awk "NR>=${EXEC_LINE} && NR<=${EXEC_LINE}+15 && /return do_execveat_common/" fs/exec.c | head -1)
+                          RETURN_LINENO=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$EXEC_LINE" '$1 >= start {print $1; exit}')
+            
+                          if [ -n "$RETURN_LINENO" ]; then
+                            sed -i "${RETURN_LINENO}i\\
+            #ifdef CONFIG_KSU\\
+            \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
+            #endif" fs/exec.c
+                            echo "  ✅ do_execve hooked at line $RETURN_LINENO"
+                          else
+                            echo "  ⚠️  Could not find return line in do_execve"
+                          fi
+            
+                          # Also hook compat_do_execve for 32-bit support
+                          COMPAT_LINE=$(grep -n "compat_do_execve\|compat_do_execveat" fs/exec.c | grep -v "ksu\|#ifdef\|common" | tail -1 | cut -d: -f1)
+                          if [ -n "$COMPAT_LINE" ]; then
+                            COMPAT_RETURN=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$COMPAT_LINE" '$1 > start {print $1; exit}')
+                            if [ -n "$COMPAT_RETURN" ]; then
+                              sed -i "${COMPAT_RETURN}i\\
+            #ifdef CONFIG_KSU // 32-bit ksud support\\
+            \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
+            #endif" fs/exec.c
                   echo "  ✅ compat_do_execve hooked at line $COMPAT_RETURN"
                 fi
               fi
