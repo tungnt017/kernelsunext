@@ -1,0 +1,273 @@
+# =============================================================================
+# KernelSU Next — Non-GKI Integration (Method 1: kprobe / Automatic Hooks)
+# =============================================================================
+# This workflow builds a custom Android kernel with KernelSU Next integrated
+# using the kprobe method. kprobe dynamically hooks kernel functions at runtime,
+# so no manual source patching is required.
+#
+# Target device : Xiaomi 11 Lite NE 5G (lisa) — Linux 5.4
+# Recommended for: Kernels >= 4.14 where kprobe works reliably
+# =============================================================================
+
+name: Build KernelSU Next (kprobe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/user/kernel_source"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "main"
+      KERNELSU_BRANCH:
+        description: "KernelSU Next branch/tag (use 'legacy' for non-GKI)"
+        required: true
+        default: "legacy"
+      DEFCONFIG:
+        description: "Defconfig name (relative to arch/arm64/configs/)"
+        required: true
+        default: "vendor/lisa_defconfig"
+      DEVICE_CODENAME:
+        description: "Device codename"
+        required: true
+        default: "lisa"
+      CLANG_REPO:
+        description: "Clang toolchain repository URL"
+        required: true
+        default: "https://github.com/ZyCromerZ/Clang/releases/download/21.0.0-20250523-release/Clang-21.0.0-20250523.tar.gz"
+      ANYKERNEL3_REPO:
+        description: "AnyKernel3 repository URL"
+        required: true
+        default: "https://github.com/osm0sis/AnyKernel3"
+
+jobs:
+  build:
+    name: Build Kernel (kprobe)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Checkout this repository (for workflow files)
+      # ---------------------------------------------------------------
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2. Install build dependencies
+      # ---------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 zip unzip curl wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            libncurses-dev cpio jq git
+
+      # ---------------------------------------------------------------
+      # 3. Clone Clang/LLVM toolchain
+      # ---------------------------------------------------------------
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+          cd $GITHUB_WORKSPACE/toolchain/clang
+
+          CLANG_URL="${{ github.event.inputs.CLANG_REPO }}"
+
+          # Support both .tar.gz releases and git repos
+          if [[ "$CLANG_URL" == *.tar.gz ]]; then
+            echo "📦 Downloading Clang tarball..."
+            wget -q "$CLANG_URL" -O clang.tar.gz
+            tar -xzf clang.tar.gz --strip-components=1
+            rm -f clang.tar.gz
+          else
+            echo "📦 Cloning Clang repository..."
+            git clone --depth=1 "$CLANG_URL" .
+          fi
+
+          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
+          echo "✅ Clang version:"
+          $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version || true
+
+      # ---------------------------------------------------------------
+      # 4. Clone kernel source
+      # ---------------------------------------------------------------
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_REPO }} \
+            $GITHUB_WORKSPACE/kernel
+          echo "✅ Kernel source cloned successfully"
+
+      # ---------------------------------------------------------------
+      # 5. Add KernelSU Next to kernel source tree
+      # ---------------------------------------------------------------
+      - name: Integrate KernelSU Next
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "📦 Adding KernelSU Next to kernel source tree..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
+          echo "✅ KernelSU Next integrated"
+
+          # Verify KernelSU directory exists
+          if [ -d "KernelSU" ]; then
+            echo "✅ KernelSU directory found"
+            ls -la KernelSU/
+          else
+            echo "❌ KernelSU directory not found!"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 6. Configure kernel — enable kprobe hooks
+      # ---------------------------------------------------------------
+      - name: Configure kernel (enable kprobe)
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.DEFCONFIG }}"
+
+          echo "📝 Patching defconfig: $DEFCONFIG_PATH"
+
+          # Remove any existing conflicting configs
+          sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
+          sed -i '/CONFIG_KSU_KPROBE_HOOKS/d' "$DEFCONFIG_PATH"
+
+          # Append kprobe-related configs
+          cat >> "$DEFCONFIG_PATH" <<'EOF'
+
+          # KernelSU Next (kprobe method)
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_KPROBE_HOOKS=y
+          CONFIG_KSU=y
+          EOF
+
+          echo "✅ Defconfig updated. Appended configs:"
+          tail -10 "$DEFCONFIG_PATH"
+
+      # ---------------------------------------------------------------
+      # 7. Build the kernel
+      # ---------------------------------------------------------------
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="github-actions"
+
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            O=out
+          )
+
+          echo "🔧 Generating defconfig..."
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.DEFCONFIG }}
+
+          echo "🔨 Building kernel (this may take 15-30 minutes)..."
+          make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tail -50
+
+          echo ""
+          echo "✅ Build completed. Checking output files..."
+          find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" \) 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # 8. Package with AnyKernel3
+      # ---------------------------------------------------------------
+      - name: Package with AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          echo "📦 Cloning AnyKernel3..."
+          git clone --depth=1 ${{ github.event.inputs.ANYKERNEL3_REPO }} AnyKernel3
+          cd AnyKernel3
+
+          # Clean up AnyKernel3 defaults
+          rm -rf .git .github modules patch ramdisk README.md
+
+          # Copy kernel image
+          KERNEL_OUT="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
+          if [ -f "$KERNEL_OUT/Image.gz" ]; then
+            cp "$KERNEL_OUT/Image.gz" .
+            echo "✅ Copied Image.gz"
+          elif [ -f "$KERNEL_OUT/Image" ]; then
+            cp "$KERNEL_OUT/Image" .
+            echo "✅ Copied Image"
+          elif [ -f "$KERNEL_OUT/Image.gz-dtb" ]; then
+            cp "$KERNEL_OUT/Image.gz-dtb" .
+            echo "✅ Copied Image.gz-dtb"
+          else
+            echo "❌ No kernel image found!"
+            find "$KERNEL_OUT" -type f 2>/dev/null
+            exit 1
+          fi
+
+          # Copy DTB files if they exist
+          if [ -f "$KERNEL_OUT/dtb.img" ]; then
+            cp "$KERNEL_OUT/dtb.img" .
+            echo "✅ Copied dtb.img"
+          elif [ -f "$KERNEL_OUT/dtb" ]; then
+            cp "$KERNEL_OUT/dtb" .
+            echo "✅ Copied dtb"
+          fi
+
+          # Copy DTBO if it exists
+          if [ -f "$KERNEL_OUT/dtbo.img" ]; then
+            cp "$KERNEL_OUT/dtbo.img" .
+            echo "✅ Copied dtbo.img"
+          fi
+
+          # Create flashable zip
+          DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="KernelSU-Next-kprobe-${DEVICE}-${DATE}.zip"
+
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '*.git*'
+          echo "✅ AnyKernel3 zip created: $ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------
+      # 9. Upload AnyKernel3 zip
+      # ---------------------------------------------------------------
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-kprobe-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      # ---------------------------------------------------------------
+      # 10. Upload raw kernel images
+      # ---------------------------------------------------------------
+      - name: Upload kernel images
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-images-kprobe-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/arch/arm64/boot/dtb*
+            kernel/out/arch/arm64/boot/dtbo.img
+          retention-days: 7
+          if-no-files-found: warn
