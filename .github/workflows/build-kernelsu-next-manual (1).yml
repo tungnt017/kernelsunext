@@ -1,0 +1,614 @@
+# =============================================================================
+# KernelSU Next — Non-GKI Integration (Method 2: Manual Hook Patches)
+# =============================================================================
+# Target device : Xiaomi 11 Lite NE 5G (lisa) — Linux 5.4
+# Recommended for: Kernels where kprobe is broken or older than 4.14
+# =============================================================================
+
+name: Build KernelSU Next (Manual Hooks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/user/kernel_source"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "main"
+      KERNELSU_BRANCH:
+        description: "KernelSU Next branch/tag (use 'legacy' for non-GKI)"
+        required: true
+        default: "legacy"
+      DEFCONFIG:
+        description: "Defconfig name (relative to arch/arm64/configs/)"
+        required: true
+        default: "vendor/lisa_defconfig"
+      DEVICE_CODENAME:
+        description: "Device codename"
+        required: true
+        default: "lisa"
+      CLANG_REPO:
+        description: "Clang toolchain repository URL"
+        required: true
+        default: "https://github.com/ZyCromerZ/Clang/releases/download/21.0.0-20250523-release/Clang-21.0.0-20250523.tar.gz"
+      ANYKERNEL3_REPO:
+        description: "AnyKernel3 repository URL"
+        required: true
+        default: "https://github.com/osm0sis/AnyKernel3"
+
+jobs:
+  build:
+    name: Build Kernel (Manual Hooks)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 zip unzip curl wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            libncurses-dev cpio jq git lld
+
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+          cd $GITHUB_WORKSPACE/toolchain/clang
+
+          CLANG_URL="${{ github.event.inputs.CLANG_REPO }}"
+
+          if [[ "$CLANG_URL" == *.tar.gz ]]; then
+            echo "📦 Downloading Clang tarball..."
+            wget -q "$CLANG_URL" -O clang.tar.gz
+            tar -xzf clang.tar.gz --strip-components=1
+            rm -f clang.tar.gz
+
+            if [ ! -f "bin/clang" ]; then
+              echo "⚠️  bin/clang not found after --strip-components=1"
+              wget -q "$CLANG_URL" -O clang.tar.gz
+              rm -rf bin lib include
+              tar -xzf clang.tar.gz
+              rm -f clang.tar.gz
+              if ls -d */bin/clang 2>/dev/null; then
+                NESTED_DIR=$(ls -d */bin/clang | head -1 | cut -d'/' -f1)
+                mv "$NESTED_DIR"/* .
+                rmdir "$NESTED_DIR" 2>/dev/null || true
+              fi
+            fi
+          else
+            echo "📦 Cloning Clang repository..."
+            git clone --depth=1 "$CLANG_URL" .
+          fi
+
+          CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
+
+          if [ ! -f "$CLANG_BIN/clang" ]; then
+            echo "❌ clang binary not found in $CLANG_BIN!"
+            find . -maxdepth 3 -type f -name "clang*" 2>/dev/null
+            exit 1
+          fi
+
+          if [ ! -f "$CLANG_BIN/ld.lld" ]; then
+            if [ -f "$CLANG_BIN/lld" ]; then
+              ln -sf "$CLANG_BIN/lld" "$CLANG_BIN/ld.lld"
+            else
+              echo "⚠️  ld.lld not found in toolchain — will use system lld"
+            fi
+          fi
+
+          echo "$CLANG_BIN" >> $GITHUB_PATH
+
+          echo ""
+          echo "✅ Toolchain verification:"
+          echo "  clang:   $($CLANG_BIN/clang --version | head -1)"
+          echo "  ld.lld:  $([ -f "$CLANG_BIN/ld.lld" ] && $CLANG_BIN/ld.lld --version | head -1 || echo 'NOT FOUND')"
+          echo "  llvm-ar: $([ -f "$CLANG_BIN/llvm-ar" ] && echo 'OK' || echo 'NOT FOUND')"
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_REPO }} \
+            $GITHUB_WORKSPACE/kernel
+          echo "✅ Kernel source cloned successfully"
+
+      - name: Integrate KernelSU Next
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "📦 Adding KernelSU Next to kernel source tree..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
+          echo "✅ KernelSU Next integrated"
+
+          if [ -d "KernelSU-Next" ]; then
+            echo "✅ KernelSU-Next directory found"
+            ls -la KernelSU-Next/
+          else
+            echo "❌ KernelSU-Next directory not found!"
+            ls -la
+            exit 1
+          fi
+
+          if [ -L "drivers/kernelsu" ] || [ -d "drivers/kernelsu" ]; then
+            echo "✅ drivers/kernelsu symlink found"
+            ls -la drivers/kernelsu
+          else
+            echo "⚠️  drivers/kernelsu symlink not found"
+          fi
+
+      - name: Configure kernel (enable CONFIG_KSU)
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.DEFCONFIG }}"
+
+          sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
+          sed -i '/CONFIG_KSU_KPROBE_HOOKS/d' "$DEFCONFIG_PATH"
+          sed -i '/CONFIG_KSU_MANUAL_HOOK/d' "$DEFCONFIG_PATH"
+
+          cat >> "$DEFCONFIG_PATH" <<'EOF'
+
+          # KernelSU Next (manual hooks — kprobes DISABLED)
+          CONFIG_KSU=y
+          # CONFIG_KSU_KPROBE_HOOKS is not set
+          CONFIG_KSU_MANUAL_HOOK=y
+          EOF
+
+          echo "✅ Defconfig updated"
+          tail -5 "$DEFCONFIG_PATH"
+
+      - name: Apply manual KernelSU hook patches
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "🔧 Applying manual hook patches (line-number based)..."
+
+          # ===========================================================
+          # PATCH 1: fs/exec.c — Hook do_execve + compat_do_execve
+          # ===========================================================
+          echo "📝 Patching fs/exec.c..."
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "  ⏭️  Already patched"
+          else
+            # Find do_execve function line
+            EXEC_LINE=$(grep -n "^int do_execve(struct filename" fs/exec.c | head -1 | cut -d: -f1)
+            if [ -z "$EXEC_LINE" ]; then
+              # Try alternative pattern
+              EXEC_LINE=$(grep -n "int do_execve(" fs/exec.c | head -1 | cut -d: -f1)
+            fi
+
+            if [ -n "$EXEC_LINE" ]; then
+              # Insert extern declaration before do_execve
+              sed -i "${EXEC_LINE}i\\
+#ifdef CONFIG_KSU\\
+__attribute__((hot))\\
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\\
+\t\t\t\tvoid *argv, void *envp, int *flags);\\
+#endif" fs/exec.c
+
+              # Recalculate — 5 lines were inserted
+              EXEC_LINE=$((EXEC_LINE + 5))
+
+              # Find "return do_execveat_common" inside do_execve (within next 15 lines)
+              RETURN_LINE=$(awk "NR>=${EXEC_LINE} && NR<=${EXEC_LINE}+15 && /return do_execveat_common/" fs/exec.c | head -1)
+              RETURN_LINENO=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$EXEC_LINE" '$1 >= start {print $1; exit}')
+
+              if [ -n "$RETURN_LINENO" ]; then
+                sed -i "${RETURN_LINENO}i\\
+#ifdef CONFIG_KSU\\
+\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
+#endif" fs/exec.c
+                echo "  ✅ do_execve hooked at line $RETURN_LINENO"
+              else
+                echo "  ⚠️  Could not find return line in do_execve"
+              fi
+
+              # Also hook compat_do_execve for 32-bit support
+              COMPAT_LINE=$(grep -n "compat_do_execve\|compat_do_execveat" fs/exec.c | grep -v "ksu\|#ifdef\|common" | tail -1 | cut -d: -f1)
+              if [ -n "$COMPAT_LINE" ]; then
+                COMPAT_RETURN=$(grep -n "return do_execveat_common" fs/exec.c | awk -F: -v start="$COMPAT_LINE" '$1 > start {print $1; exit}')
+                if [ -n "$COMPAT_RETURN" ]; then
+                  sed -i "${COMPAT_RETURN}i\\
+#ifdef CONFIG_KSU // 32-bit ksud support\\
+\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\\
+#endif" fs/exec.c
+                  echo "  ✅ compat_do_execve hooked at line $COMPAT_RETURN"
+                fi
+              fi
+            else
+              echo "  ❌ Could not find do_execve function!"
+            fi
+          fi
+
+          # ===========================================================
+          # PATCH 2: fs/open.c — Hook do_faccessat
+          # ===========================================================
+          echo "📝 Patching fs/open.c..."
+          if grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "  ⏭️  Already patched"
+          else
+            # Find do_faccessat function
+            FUNC_LINE=$(grep -n "long do_faccessat(int dfd" fs/open.c | head -1 | cut -d: -f1)
+            if [ -n "$FUNC_LINE" ]; then
+              # Insert extern declaration before function
+              sed -i "${FUNC_LINE}i\\
+#ifdef CONFIG_KSU\\
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\\
+\t\t\t\tint *mode, int *flags);\\
+#endif" fs/open.c
+
+              # Find opening brace and first code line after variable declarations
+              FUNC_LINE=$((FUNC_LINE + 4))
+              # Find "struct path" or "struct cred" — common variables in do_faccessat
+              VAR_LINE=$(awk "NR>=${FUNC_LINE} && /struct (path|cred)/" fs/open.c | head -1)
+              VAR_LINENO=$(grep -n "struct path\|struct cred" fs/open.c | awk -F: -v start="$FUNC_LINE" '$1 >= start {print $1; exit}')
+
+              if [ -n "$VAR_LINENO" ]; then
+                sed -i "${VAR_LINENO}a\\
+#ifdef CONFIG_KSU\\
+\tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\\
+#endif" fs/open.c
+                echo "  ✅ do_faccessat hooked at line $VAR_LINENO"
+              else
+                echo "  ⚠️  Could not find variable declaration in do_faccessat"
+              fi
+            else
+              echo "  ❌ Could not find do_faccessat function!"
+            fi
+          fi
+
+          # ===========================================================
+          # PATCH 3: fs/read_write.c — Hook vfs_read
+          # ===========================================================
+          echo "📝 Patching fs/read_write.c..."
+          if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            echo "  ⏭️  Already patched"
+          else
+            FUNC_LINE=$(grep -n "^ssize_t vfs_read(" fs/read_write.c | head -1 | cut -d: -f1)
+            if [ -z "$FUNC_LINE" ]; then
+              FUNC_LINE=$(grep -n "ssize_t vfs_read(struct file" fs/read_write.c | head -1 | cut -d: -f1)
+            fi
+
+            if [ -n "$FUNC_LINE" ]; then
+              # Insert extern declaration before vfs_read
+              sed -i "${FUNC_LINE}i\\
+#ifdef CONFIG_KSU\\
+extern bool ksu_vfs_read_hook __read_mostly;\\
+extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\\
+\t\t\t\tsize_t *count_ptr, loff_t **pos);\\
+#endif" fs/read_write.c
+
+              # Find opening brace of vfs_read (adjusted for inserted lines)
+              FUNC_LINE=$((FUNC_LINE + 5))
+              BRACE_LINE=$(awk "NR>=${FUNC_LINE} && /^{/" fs/read_write.c | head -1)
+              BRACE_LINENO=$(grep -n "^{" fs/read_write.c | awk -F: -v start="$FUNC_LINE" '$1 >= start {print $1; exit}')
+
+              if [ -n "$BRACE_LINENO" ]; then
+                sed -i "${BRACE_LINENO}a\\
+#ifdef CONFIG_KSU\\
+\tif (unlikely(ksu_vfs_read_hook))\\
+\t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\\
+#endif" fs/read_write.c
+                echo "  ✅ vfs_read hooked at line $BRACE_LINENO"
+              else
+                echo "  ⚠️  Could not find opening brace"
+              fi
+            else
+              echo "  ❌ Could not find vfs_read function!"
+            fi
+          fi
+
+          # ===========================================================
+          # PATCH 4: fs/stat.c — Hook vfs_statx
+          # ===========================================================
+          echo "📝 Patching fs/stat.c..."
+          if grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "  ⏭️  Already patched"
+          else
+            FUNC_LINE=$(grep -n "int vfs_statx(int dfd" fs/stat.c | head -1 | cut -d: -f1)
+            if [ -n "$FUNC_LINE" ]; then
+              sed -i "${FUNC_LINE}i\\
+#ifdef CONFIG_KSU\\
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\\
+\t\t\t\tint *flags);\\
+#endif" fs/stat.c
+
+              FUNC_LINE=$((FUNC_LINE + 4))
+              # Find "struct path" in vfs_statx
+              VAR_LINENO=$(grep -n "struct path" fs/stat.c | awk -F: -v start="$FUNC_LINE" '$1 >= start {print $1; exit}')
+
+              if [ -n "$VAR_LINENO" ]; then
+                sed -i "${VAR_LINENO}a\\
+#ifdef CONFIG_KSU\\
+\tksu_handle_stat(\&dfd, \&filename, \&flags);\\
+#endif" fs/stat.c
+                echo "  ✅ vfs_statx hooked at line $VAR_LINENO"
+              else
+                echo "  ⚠️  Could not find struct path in vfs_statx"
+              fi
+            else
+              echo "  ❌ Could not find vfs_statx function!"
+            fi
+          fi
+
+          # ===========================================================
+          # PATCH 5: kernel/reboot.c — Hook reboot syscall
+          # ===========================================================
+          echo "📝 Patching kernel/reboot.c..."
+          if grep -q "ksu_handle_reboot" kernel/reboot.c; then
+            echo "  ⏭️  Already patched"
+          else
+            # Insert extern at top of file (after includes)
+            INCLUDE_LINE=$(grep -n "#include <linux/reboot.h>" kernel/reboot.c | head -1 | cut -d: -f1)
+            if [ -n "$INCLUDE_LINE" ]; then
+              sed -i "${INCLUDE_LINE}a\\
+\\
+#ifdef CONFIG_KSU\\
+extern bool ksu_android_reboot_trigger __read_mostly;\\
+extern int ksu_handle_reboot(void);\\
+#endif" kernel/reboot.c
+            fi
+
+            # Find SYSCALL_DEFINE4(reboot
+            SYSCALL_LINE=$(grep -n "SYSCALL_DEFINE4(reboot" kernel/reboot.c | head -1 | cut -d: -f1)
+            if [ -n "$SYSCALL_LINE" ]; then
+              # Find mutex_lock after SYSCALL_DEFINE4
+              MUTEX_LINE=$(grep -n "mutex_lock" kernel/reboot.c | awk -F: -v start="$SYSCALL_LINE" '$1 > start {print $1; exit}')
+              if [ -n "$MUTEX_LINE" ]; then
+                sed -i "${MUTEX_LINE}i\\
+#ifdef CONFIG_KSU\\
+\tksu_handle_reboot();\\
+#endif" kernel/reboot.c
+                echo "  ✅ reboot syscall hooked at line $MUTEX_LINE"
+              else
+                echo "  ⚠️  Could not find mutex_lock in reboot syscall"
+              fi
+            else
+              echo "  ❌ Could not find SYSCALL_DEFINE4(reboot)!"
+            fi
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "✅ All 5 manual hook patches applied!"
+          echo "============================================"
+          echo ""
+          echo "📋 Verification:"
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
+            COUNT=$(grep -c "CONFIG_KSU" "$f" 2>/dev/null || echo "0")
+            echo "  $f: $COUNT KSU references"
+          done
+
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          cd $GITHUB_WORKSPACE/kernel
+
+          mkdir -p out
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="github-actions"
+
+          # Suppress Clang 21 warnings promoted to errors on older kernels (5.4)
+          # -Wno-enum-conversion:                          rmnet_ipa.c enum mismatch
+          # -Wno-single-bit-bitfield-constant-conversion:  tcp_timer.c / usbdtp.c 1-bit bitfield
+          # -Wno-array-parameter:                          qcacld parser_api.c array bound mismatch
+          # -Wno-implicit-int:                             sde_hw_dsc_1_2.c missing return type
+          # -Wno-declaration-after-statement:              fs/open.c mixing declarations and code
+          # -Wno-implicit-function-declaration:             safety net for hook extern declarations
+          export KCFLAGS="-Wno-enum-conversion -Wno-single-bit-bitfield-constant-conversion -Wno-array-parameter -Wno-implicit-int -Wno-declaration-after-statement -Wno-implicit-function-declaration"
+
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            LD=ld.lld
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            O=out
+          )
+
+          echo "🔧 Generating defconfig..."
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.DEFCONFIG }} 2>&1 | tee out/build_defconfig.log
+
+          echo "🔨 Building kernel (this may take 15-30 minutes)..."
+          make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tee out/build.log
+
+          echo ""
+          echo "✅ Build completed. Checking output files..."
+          find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" -o -name "*.dtbo" \) 2>/dev/null || true
+
+      - name: Check build output
+        if: always()
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "📋 Full listing of out/arch/arm64/boot/:"
+          find out/arch/arm64/boot -type f 2>/dev/null | head -50 || echo "  (directory not found)"
+
+          echo ""
+          echo "📋 Searching for kernel images anywhere in out/:"
+          find out -type f \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "zImage" \) 2>/dev/null || echo "  (no kernel images found)"
+
+          echo ""
+          echo "📋 Searching for DTB/DTBO files:"
+          find out -type f \( -name "*.dtb" -o -name "*.dtbo" \) 2>/dev/null | head -20 || echo "  (none found)"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: |
+            kernel/out/build_defconfig.log
+            kernel/out/build.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Package with AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          echo "📦 Cloning AnyKernel3..."
+          git clone --depth=1 ${{ github.event.inputs.ANYKERNEL3_REPO }} AnyKernel3
+          cd AnyKernel3
+
+          rm -rf .git .github modules patch ramdisk README.md
+
+          # Write a properly configured anykernel.sh for the target device
+          DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
+          cat > anykernel.sh << AKEOF
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
+          
+          ## AnyKernel setup
+          # begin properties
+          properties() { '
+          kernel.string=KernelSU-Next Kernel for ${DEVICE}
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=${DEVICE}
+          device.name2=${DEVICE}
+          supported.versions=
+          supported.patchlevels=
+          '; } # end properties
+          
+          # shell variables
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          
+          ## AnyKernel methods (DO NOT CHANGE)
+          . tools/ak3-core.sh;
+          
+          ## AnyKernel file attributes
+          # set permissions/ownership for included ramdisk files
+          set_perm_recursive 0 0 755 644 \$ramdisk/*;
+          
+          ## AnyKernel install
+          dump_boot;
+          
+          write_boot;
+          ## end install
+          AKEOF
+          echo "✅ anykernel.sh written for device: ${DEVICE}"
+          echo "📋 anykernel.sh contents:"
+          cat anykernel.sh
+
+          KERNEL_OUT="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
+          FOUND_IMAGE=false
+
+          for img in Image.gz Image Image.gz-dtb zImage zImage-dtb; do
+            if [ -f "$KERNEL_OUT/$img" ]; then
+              cp "$KERNEL_OUT/$img" .
+              echo "✅ Copied $img (from standard path)"
+              FOUND_IMAGE=true
+              break
+            fi
+          done
+
+          if [ "$FOUND_IMAGE" = false ]; then
+            echo "⚠️  No kernel image in standard path, searching recursively..."
+            FOUND=$(find "$GITHUB_WORKSPACE/kernel/out" -type f \( -name "Image.gz" -o -name "Image" -o -name "Image.gz-dtb" \) | head -1)
+            if [ -n "$FOUND" ]; then
+              cp "$FOUND" .
+              echo "✅ Copied $(basename $FOUND) (from $FOUND)"
+              FOUND_IMAGE=true
+            else
+              echo "❌ No kernel image found anywhere in out/!"
+              find "$KERNEL_OUT" -type f 2>/dev/null
+              exit 1
+            fi
+          fi
+
+          if [ -f "$KERNEL_OUT/dtb.img" ]; then
+            cp "$KERNEL_OUT/dtb.img" ./dtb
+            echo "✅ Copied dtb.img as dtb"
+          elif [ -f "$KERNEL_OUT/dtb" ]; then
+            cp "$KERNEL_OUT/dtb" .
+            echo "✅ Copied dtb"
+          else
+            QCOM_DTB=$(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | head -1)
+            if [ -n "$QCOM_DTB" ]; then
+              DTB_COUNT=$(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | wc -l)
+              if [ "$DTB_COUNT" -eq 1 ]; then
+                cp "$QCOM_DTB" ./dtb
+                echo "✅ Copied DTB: $(basename $QCOM_DTB)"
+              else
+                cat $(find "$KERNEL_OUT/dts" -type f -name "*.dtb" 2>/dev/null | sort) > ./dtb
+                echo "✅ Merged $DTB_COUNT DTB files into dtb"
+              fi
+            else
+              echo "ℹ️  No DTB files found"
+            fi
+          fi
+
+          if [ -f "$KERNEL_OUT/dtbo.img" ]; then
+            cp "$KERNEL_OUT/dtbo.img" .
+            echo "✅ Copied dtbo.img"
+          else
+            QCOM_DTBO=$(find "$KERNEL_OUT/dts" -type f -name "*${{ github.event.inputs.DEVICE_CODENAME }}*.dtbo" 2>/dev/null | head -1)
+            if [ -z "$QCOM_DTBO" ]; then
+              QCOM_DTBO=$(find "$KERNEL_OUT/dts" -type f -name "*.dtbo" 2>/dev/null | head -1)
+            fi
+            if [ -n "$QCOM_DTBO" ]; then
+              cp "$QCOM_DTBO" ./dtbo.img
+              echo "✅ Copied DTBO: $(basename $QCOM_DTBO) as dtbo.img"
+            else
+              echo "ℹ️  No DTBO files found"
+            fi
+          fi
+
+          echo ""
+          echo "📋 AnyKernel3 package contents:"
+          ls -la *.gz *.dtb *.dtbo *.img Image* zImage* dtb dtbo 2>/dev/null || echo "  (only script files)"
+
+          DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="KernelSU-Next-manual-${DEVICE}-${DATE}.zip"
+
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '*.git*'
+          echo "✅ AnyKernel3 zip created: $ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      - name: Upload kernel images
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-images-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/arch/arm64/boot/dtb*
+            kernel/out/arch/arm64/boot/dtbo.img
+            kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtb
+            kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtbo
+          retention-days: 7
+          if-no-files-found: warn
