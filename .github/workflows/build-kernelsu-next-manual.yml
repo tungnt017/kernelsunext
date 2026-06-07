@@ -1,0 +1,453 @@
+# =============================================================================
+# KernelSU Next — Non-GKI Integration (Method 2: Manual Hook Patches)
+# =============================================================================
+# This workflow builds a custom Android kernel with KernelSU Next integrated
+# using manual source code modifications. This method patches 5 kernel source
+# files to add KernelSU hook calls directly.
+#
+# Target device : Xiaomi 11 Lite NE 5G (lisa) — Linux 5.4
+# Recommended for: Kernels where kprobe is broken or older than 4.14
+# =============================================================================
+
+name: Build KernelSU Next (Manual Hooks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/user/kernel_source"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "main"
+      KERNELSU_BRANCH:
+        description: "KernelSU Next branch/tag (use 'legacy' for non-GKI)"
+        required: true
+        default: "legacy"
+      DEFCONFIG:
+        description: "Defconfig name (relative to arch/arm64/configs/)"
+        required: true
+        default: "vendor/lisa_defconfig"
+      DEVICE_CODENAME:
+        description: "Device codename"
+        required: true
+        default: "lisa"
+      CLANG_REPO:
+        description: "Clang toolchain repository URL"
+        required: true
+        default: "https://github.com/ZyCromerZ/Clang/releases/download/21.0.0-20250523-release/Clang-21.0.0-20250523.tar.gz"
+      ANYKERNEL3_REPO:
+        description: "AnyKernel3 repository URL"
+        required: true
+        default: "https://github.com/osm0sis/AnyKernel3"
+
+jobs:
+  build:
+    name: Build Kernel (Manual Hooks)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Checkout this repository (for workflow files)
+      # ---------------------------------------------------------------
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2. Install build dependencies
+      # ---------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 zip unzip curl wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            libncurses-dev cpio jq git
+
+      # ---------------------------------------------------------------
+      # 3. Clone Clang/LLVM toolchain
+      # ---------------------------------------------------------------
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+          cd $GITHUB_WORKSPACE/toolchain/clang
+
+          CLANG_URL="${{ github.event.inputs.CLANG_REPO }}"
+
+          # Support both .tar.gz releases and git repos
+          if [[ "$CLANG_URL" == *.tar.gz ]]; then
+            echo "📦 Downloading Clang tarball..."
+            wget -q "$CLANG_URL" -O clang.tar.gz
+            tar -xzf clang.tar.gz --strip-components=1
+            rm -f clang.tar.gz
+          else
+            echo "📦 Cloning Clang repository..."
+            git clone --depth=1 "$CLANG_URL" .
+          fi
+
+          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_PATH
+          echo "✅ Clang version:"
+          $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version || true
+
+      # ---------------------------------------------------------------
+      # 4. Clone kernel source
+      # ---------------------------------------------------------------
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_REPO }} \
+            $GITHUB_WORKSPACE/kernel
+          echo "✅ Kernel source cloned successfully"
+
+      # ---------------------------------------------------------------
+      # 5. Add KernelSU Next to kernel source tree
+      # ---------------------------------------------------------------
+      - name: Integrate KernelSU Next
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "📦 Adding KernelSU Next to kernel source tree..."
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
+          echo "✅ KernelSU Next integrated"
+
+          # Verify KernelSU directory exists
+          if [ -d "KernelSU" ]; then
+            echo "✅ KernelSU directory found"
+            ls -la KernelSU/
+          else
+            echo "❌ KernelSU directory not found!"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 6. Configure kernel — enable CONFIG_KSU
+      # ---------------------------------------------------------------
+      - name: Configure kernel (enable CONFIG_KSU)
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.DEFCONFIG }}"
+
+          echo "📝 Patching defconfig: $DEFCONFIG_PATH"
+
+          # Remove any existing conflicting configs
+          sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
+
+          # Append KSU config (kprobe hooks disabled — using manual hooks)
+          cat >> "$DEFCONFIG_PATH" <<'EOF'
+
+          # KernelSU Next (manual hooks method)
+          CONFIG_KSU=y
+          EOF
+
+          echo "✅ Defconfig updated. Appended configs:"
+          tail -5 "$DEFCONFIG_PATH"
+
+      # ---------------------------------------------------------------
+      # 7. Apply manual hook patches to kernel source files
+      # ---------------------------------------------------------------
+      - name: Apply manual KernelSU hook patches
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "🔧 Applying manual hook patches to kernel source..."
+
+          # ===========================================================
+          # PATCH 1: fs/exec.c — Hook do_execveat / do_execve
+          # ===========================================================
+          echo "📝 Patching fs/exec.c..."
+          cat > /tmp/exec.patch << 'PATCH_EOF'
+          --- a/fs/exec.c
+          +++ b/fs/exec.c
+          @@ -1,3 +1,10 @@
+          +#ifdef CONFIG_KSU
+          +__attribute__((hot))
+          +extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          +				void *argv, void *envp, int *flags);
+          +#endif
+          +
+           int do_execve(struct filename *filename,
+          PATCH_EOF
+
+          # Insert KSU extern declaration before do_execve function
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "  ⏭️  fs/exec.c already patched, skipping..."
+          else
+            # Add extern declaration before do_execve
+            sed -i '/^int do_execve(struct filename \*filename,/i \
+          #ifdef CONFIG_KSU\n\
+          __attribute__((hot))\n\
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\
+          \t\t\t\tvoid *argv, void *envp, int *flags);\n\
+          #endif\n' fs/exec.c
+
+            # Add hook call inside do_execve — after the envp variable declaration
+            # Pattern: find "struct user_arg_ptr envp = { .ptr.native = __envp };"
+            # and add the hook call after it (inside do_execve)
+            sed -i '/struct user_arg_ptr argv = { \.ptr\.native = __argv };/{
+              N
+              /struct user_arg_ptr envp = { \.ptr\.native = __envp };/a \
+          #ifdef CONFIG_KSU\n\
+          \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\n\
+          #endif
+            }' fs/exec.c
+
+            # Also patch compat_do_execve for 32-bit support
+            # Look for the compat version's envp declaration
+            sed -i '/\.ptr\.compat = __envp,/{
+              N
+              /};/a \
+          #ifdef CONFIG_KSU \/\/ 32-bit ksud and 32-on-64 support\n\
+          \tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\n\
+          #endif
+            }' fs/exec.c
+
+            echo "  ✅ fs/exec.c patched"
+          fi
+
+          # ===========================================================
+          # PATCH 2: fs/open.c — Hook faccessat syscall
+          # ===========================================================
+          echo "📝 Patching fs/open.c..."
+          if grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "  ⏭️  fs/open.c already patched, skipping..."
+          else
+            # Add extern declaration at the top of the file (after includes)
+            sed -i '/^#include <linux\/fs\.h>/a \
+          \n\
+          #ifdef CONFIG_KSU\n\
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\
+          \t\t\t\tint *mode, int *flags);\n\
+          #endif' fs/open.c
+
+            # Add hook call inside do_faccessat — after variable declarations
+            # Find the function and add the hook after the initial variable setup
+            sed -i '/long do_faccessat(int dfd, const char __user \*filename, int mode/{
+              # Read lines until we find the opening brace pattern
+              N;N;N;N;N
+              /struct path path;/a \
+          #ifdef CONFIG_KSU\n\
+          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\n\
+          #endif
+            }' fs/open.c
+
+            echo "  ✅ fs/open.c patched"
+          fi
+
+          # ===========================================================
+          # PATCH 3: fs/read_write.c — Hook vfs_read
+          # ===========================================================
+          echo "📝 Patching fs/read_write.c..."
+          if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            echo "  ⏭️  fs/read_write.c already patched, skipping..."
+          else
+            # Add extern declaration before vfs_read function
+            sed -i '/^ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/i \
+          #ifdef CONFIG_KSU\n\
+          extern bool ksu_vfs_read_hook __read_mostly;\n\
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n\
+          \t\t\t\tsize_t *count_ptr, loff_t **pos);\n\
+          #endif' fs/read_write.c
+
+            # Add hook call inside vfs_read — after the initial checks
+            sed -i '/ssize_t vfs_read(struct file \*file, char __user \*buf, size_t count, loff_t \*pos)/{
+              N
+              /^{/a \
+          #ifdef CONFIG_KSU\n\
+          \tif (unlikely(ksu_vfs_read_hook))\n\
+          \t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\n\
+          #endif
+            }' fs/read_write.c
+
+            echo "  ✅ fs/read_write.c patched"
+          fi
+
+          # ===========================================================
+          # PATCH 4: fs/stat.c — Hook vfs_statx / newstat syscall
+          # ===========================================================
+          echo "📝 Patching fs/stat.c..."
+          if grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "  ⏭️  fs/stat.c already patched, skipping..."
+          else
+            # Add extern declaration near the top
+            sed -i '/^#include <linux\/fs\.h>/a \
+          \n\
+          #ifdef CONFIG_KSU\n\
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\
+          \t\t\t\tint *flags);\n\
+          #endif' fs/stat.c
+
+            # Hook into vfs_statx — add after the function signature
+            sed -i '/int vfs_statx(int dfd, const char __user \*filename, int flags,/{
+              N
+              /struct path path;/a \
+          #ifdef CONFIG_KSU\n\
+          \tksu_handle_stat(\&dfd, \&filename, \&flags);\n\
+          #endif
+            }' fs/stat.c
+
+            echo "  ✅ fs/stat.c patched"
+          fi
+
+          # ===========================================================
+          # PATCH 5: kernel/reboot.c — Hook reboot syscall
+          # ===========================================================
+          echo "📝 Patching kernel/reboot.c..."
+          if grep -q "ksu_handle_reboot" kernel/reboot.c; then
+            echo "  ⏭️  kernel/reboot.c already patched, skipping..."
+          else
+            # Add extern declaration near the top
+            sed -i '/#include <linux\/reboot\.h>/a \
+          \n\
+          #ifdef CONFIG_KSU\n\
+          extern bool ksu_android_reboot_trigger __read_mostly;\n\
+          extern int ksu_handle_reboot(void);\n\
+          #endif' kernel/reboot.c
+
+            # Hook into __orderly_reboot or the reboot syscall
+            # For kernels with SYSCALL_DEFINE4(reboot, ...)
+            sed -i '/SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/{
+              N;N;N;N
+              /mutex_lock/i \
+          #ifdef CONFIG_KSU\n\
+          \tksu_handle_reboot();\n\
+          #endif
+            }' kernel/reboot.c
+
+            echo "  ✅ kernel/reboot.c patched"
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "✅ All 5 manual hook patches applied!"
+          echo "============================================"
+          echo ""
+          echo "📋 Verification — checking for KSU hooks in patched files:"
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
+            COUNT=$(grep -c "CONFIG_KSU" "$f" 2>/dev/null || echo "0")
+            echo "  $f: $COUNT KSU references"
+          done
+
+      # ---------------------------------------------------------------
+      # 8. Build the kernel
+      # ---------------------------------------------------------------
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="github-actions"
+
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
+          MAKE_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            O=out
+          )
+
+          echo "🔧 Generating defconfig..."
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.DEFCONFIG }}
+
+          echo "🔨 Building kernel (this may take 15-30 minutes)..."
+          make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tail -50
+
+          echo ""
+          echo "✅ Build completed. Checking output files..."
+          find out/arch/arm64/boot -type f \( -name "Image*" -o -name "dtb*" -o -name "*.dtb" \) 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # 9. Package with AnyKernel3
+      # ---------------------------------------------------------------
+      - name: Package with AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          echo "📦 Cloning AnyKernel3..."
+          git clone --depth=1 ${{ github.event.inputs.ANYKERNEL3_REPO }} AnyKernel3
+          cd AnyKernel3
+
+          # Clean up AnyKernel3 defaults
+          rm -rf .git .github modules patch ramdisk README.md
+
+          # Copy kernel image
+          KERNEL_OUT="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
+          if [ -f "$KERNEL_OUT/Image.gz" ]; then
+            cp "$KERNEL_OUT/Image.gz" .
+            echo "✅ Copied Image.gz"
+          elif [ -f "$KERNEL_OUT/Image" ]; then
+            cp "$KERNEL_OUT/Image" .
+            echo "✅ Copied Image"
+          elif [ -f "$KERNEL_OUT/Image.gz-dtb" ]; then
+            cp "$KERNEL_OUT/Image.gz-dtb" .
+            echo "✅ Copied Image.gz-dtb"
+          else
+            echo "❌ No kernel image found!"
+            find "$KERNEL_OUT" -type f 2>/dev/null
+            exit 1
+          fi
+
+          # Copy DTB files if they exist
+          if [ -f "$KERNEL_OUT/dtb.img" ]; then
+            cp "$KERNEL_OUT/dtb.img" .
+            echo "✅ Copied dtb.img"
+          elif [ -f "$KERNEL_OUT/dtb" ]; then
+            cp "$KERNEL_OUT/dtb" .
+            echo "✅ Copied dtb"
+          fi
+
+          # Copy DTBO if it exists
+          if [ -f "$KERNEL_OUT/dtbo.img" ]; then
+            cp "$KERNEL_OUT/dtbo.img" .
+            echo "✅ Copied dtbo.img"
+          fi
+
+          # Create flashable zip
+          DEVICE="${{ github.event.inputs.DEVICE_CODENAME }}"
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="KernelSU-Next-manual-${DEVICE}-${DATE}.zip"
+
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '*.git*'
+          echo "✅ AnyKernel3 zip created: $ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------
+      # 10. Upload AnyKernel3 zip
+      # ---------------------------------------------------------------
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      # ---------------------------------------------------------------
+      # 11. Upload raw kernel images
+      # ---------------------------------------------------------------
+      - name: Upload kernel images
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-images-manual-${{ github.event.inputs.DEVICE_CODENAME }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz-dtb
+            kernel/out/arch/arm64/boot/dtb*
+            kernel/out/arch/arm64/boot/dtbo.img
+          retention-days: 7
+          if-no-files-found: warn
