@@ -1,0 +1,240 @@
+# ==============================================================================
+# KernelSU Next — Non-GKI Integration (Method 1: kprobe / Automatic Hooks)
+# ==============================================================================
+# Target device : Xiaomi 11 Lite NE 5G (lisa) — Linux 5.4
+# Recommended for: Kernels >= 4.14 where kprobe works reliably
+# Fix applied    : AnyKernel3 "no ramdisk found" — kernel-only boot image
+# ==============================================================================
+
+name: Build KernelSU Next (kprobe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/user/kernel_source"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "main"
+      KERNELSU_BRANCH:
+        description: "KernelSU Next branch/tag (use 'legacy' for non-GKI)"
+        required: true
+        default: "legacy"
+      DEFCONFIG:
+        description: "Defconfig name (relative to arch/arm64/configs/)"
+        required: true
+        default: "vendor/lisa_defconfig"
+      DEVICE_CODENAME:
+        description: "Device codename"
+        required: true
+        default: "lisa"
+      CLANG_REPO:
+        description: "Clang toolchain repository URL"
+        required: true
+        default: "https://github.com/ZyCromerZ/Clang/releases/download/21.0.0-20250523-release/Clang-21.0.0-20250523.tar.gz"
+      ANYKERNEL3_REPO:
+        description: "AnyKernel3 repository URL"
+        required: true
+        default: "https://github.com/osm0sis/AnyKernel3"
+
+jobs:
+  build:
+    name: Build Kernel (kprobe)
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout this repository (needed for GitHub Actions context)
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Install build dependencies
+      # -----------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 python-is-python3 \
+            libelf-dev
+
+      # -----------------------------------------------------------------------
+      # 3. Clone kernel source
+      # -----------------------------------------------------------------------
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_REPO }} kernel
+          echo "Kernel source cloned successfully."
+
+      # -----------------------------------------------------------------------
+      # 4. Integrate KernelSU-Next (legacy / kprobe method)
+      # -----------------------------------------------------------------------
+      - name: Integrate KernelSU-Next
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ github.event.inputs.KERNELSU_BRANCH }}
+          echo "KernelSU-Next integrated (branch: ${{ github.event.inputs.KERNELSU_BRANCH }})"
+
+      # -----------------------------------------------------------------------
+      # 5. Download and extract Clang toolchain
+      # -----------------------------------------------------------------------
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p clang
+          echo "Downloading Clang toolchain..."
+          wget -q "${{ github.event.inputs.CLANG_REPO }}" -O clang.tar.gz
+          tar -xzf clang.tar.gz -C clang --strip-components=1
+          rm clang.tar.gz
+          echo "Clang version:"
+          ./clang/bin/clang --version
+
+      # -----------------------------------------------------------------------
+      # 6. Build the kernel
+      # -----------------------------------------------------------------------
+      - name: Build kernel
+        run: |
+          export PATH="$(pwd)/clang/bin:$PATH"
+          cd kernel
+
+          # Generate defconfig
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ${{ github.event.inputs.DEFCONFIG }}
+
+          # Build Image
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      # -----------------------------------------------------------------------
+      # 7. Verify kernel Image was built
+      # -----------------------------------------------------------------------
+      - name: Verify kernel Image
+        run: |
+          if [ ! -f "kernel/out/arch/arm64/boot/Image" ]; then
+            echo "ERROR: Kernel Image not found!"
+            exit 1
+          fi
+          echo "Kernel Image built successfully:"
+          ls -lh kernel/out/arch/arm64/boot/Image
+
+      # -----------------------------------------------------------------------
+      # 8. Clone AnyKernel3
+      # -----------------------------------------------------------------------
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 ${{ github.event.inputs.ANYKERNEL3_REPO }} AnyKernel3
+          echo "AnyKernel3 cloned."
+
+      # -----------------------------------------------------------------------
+      # 9. Configure AnyKernel3 for lisa (kernel-only, no-ramdisk fix)
+      # -----------------------------------------------------------------------
+      - name: Configure AnyKernel3 for lisa (no-ramdisk fix)
+        run: |
+          cat > AnyKernel3/anykernel.sh << 'ANYKERNEL_EOF'
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
+          # Customized for Xiaomi 11 Lite NE 5G (lisa) — kernel-only boot image
+
+          ## AnyKernel setup
+          # begin properties
+          properties() { '
+          kernel.string=KernelSU-Next for Xiaomi 11 Lite NE 5G (lisa)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lisa
+          device.name2=lisain
+          device.name3=lisalitein
+          supported.versions=
+          supported.patchlevel=
+          '; } # end properties
+
+          # shell variables
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          ## AnyKernel boot install
+          # Dump the current boot image
+          split_boot;
+
+          # Replace only the kernel Image (no ramdisk unpack/repack needed)
+          flash_boot;
+          ## end boot install
+          ANYKERNEL_EOF
+
+          # Remove leading whitespace from heredoc (caused by YAML indentation)
+          sed -i 's/^          //' AnyKernel3/anykernel.sh
+
+          echo "=== AnyKernel3 configured for lisa (no-ramdisk kernel-only install) ==="
+          cat AnyKernel3/anykernel.sh
+
+      # -----------------------------------------------------------------------
+      # 10. Copy kernel Image (and dtbo if exists) into AnyKernel3
+      # -----------------------------------------------------------------------
+      - name: Package kernel into AnyKernel3
+        run: |
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+
+          # Copy dtbo.img if it was generated
+          if [ -f "kernel/out/arch/arm64/boot/dtbo.img" ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
+            echo "dtbo.img included."
+          fi
+
+          # Copy DTB files if present
+          if ls kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtb 1>/dev/null 2>&1; then
+            mkdir -p AnyKernel3/dtb
+            cp kernel/out/arch/arm64/boot/dts/vendor/qcom/*.dtb AnyKernel3/dtb/
+            echo "DTB files included."
+          fi
+
+          # Clean up AnyKernel3 unnecessary files
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
+
+          echo "Kernel packaged into AnyKernel3."
+
+      # -----------------------------------------------------------------------
+      # 11. Create flashable ZIP
+      # -----------------------------------------------------------------------
+      - name: Create flashable ZIP
+        run: |
+          cd AnyKernel3
+          ZIP_NAME="KernelSU-Next-${{ github.event.inputs.DEVICE_CODENAME }}-kprobe-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../${ZIP_NAME}" * -x '*.git*'
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Flashable ZIP created: ${ZIP_NAME}"
+
+      # -----------------------------------------------------------------------
+      # 12. Upload artifact
+      # -----------------------------------------------------------------------
+      - name: Upload kernel ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
